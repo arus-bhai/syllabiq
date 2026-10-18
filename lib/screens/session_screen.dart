@@ -1,12 +1,15 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:vad/vad.dart';
 
 import '../services/api_service.dart';
 import '../services/chime_player.dart';
 import '../services/live_pcm_player.dart';
+import '../services/offline_queue_service.dart';
+import '../services/response_cache_service.dart';
 import '../utils/wav_encoder.dart';
 import '../widgets/listening_mic_indicator.dart';
 import '../widgets/study_background.dart';
@@ -33,11 +36,14 @@ class _SessionScreenState extends State<SessionScreen> {
   late final VadHandler _vadHandler;
   final LivePcmPlayer _playback = LivePcmPlayer();
   final ChimePlayer _chime = ChimePlayer();
+  final OfflineQueueService _offlineQueue = OfflineQueueService();
+  final ResponseCacheService _responseCache = ResponseCacheService();
 
   StreamSubscription? _speechStartSub;
   StreamSubscription? _speechEndSub;
   StreamSubscription? _misfireSub;
   StreamSubscription? _errorSub;
+  StreamSubscription? _connectivitySub;
 
   AssistantState _state = AssistantState.initializing;
   String? _lastResponseText;
@@ -50,7 +56,9 @@ class _SessionScreenState extends State<SessionScreen> {
   bool _vadInitialized = false;
 
   /// Audio for the most recent response only — enough for the replay
-  /// button. Not kept per history entry; only ever the latest one.
+  /// button. Not kept per history entry; only ever the latest one. Backed
+  /// by [ResponseCacheService] on disk, so it survives app restarts and
+  /// works with no network at all.
   Uint8List? _lastResponsePcm;
 
   /// Text-only history of the last 3 responses, newest last. No audio
@@ -58,6 +66,12 @@ class _SessionScreenState extends State<SessionScreen> {
   /// separate transcription of what the user said.
   static const _maxQueueSize = 3;
   final List<String> _responseTextQueue = [];
+
+  /// How many recorded questions are currently sitting in the offline
+  /// queue, waiting for connectivity to come back. Drives the small
+  /// "waiting to send" banner.
+  int _pendingCount = 0;
+  bool _isDraining = false;
 
   @override
   void initState() {
@@ -86,7 +100,36 @@ class _SessionScreenState extends State<SessionScreen> {
     _misfireSub = _vadHandler.onVADMisfire.listen((_) => _onMisfire());
     _errorSub = _vadHandler.onError.listen(_onVadError);
 
+    // Fires whenever the device's connectivity state changes. Used only as
+    // a trigger to try sending whatever's queued — the actual network call
+    // inside drainQueue() is still the source of truth (a device can report
+    // "wifi" while the wifi has no real internet access).
+    _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
+      final online = results.any((r) => r != ConnectivityResult.none);
+      if (online) _drainOfflineQueue();
+    });
+
+    _loadPersistedResponseCache();
+    _refreshPendingCount();
     _initSession();
+  }
+
+  /// Loads whatever answer was last durably cached (possibly from a
+  /// previous app run, or from a question that was queued offline and sent
+  /// in the background) so Replay works immediately, even with no network.
+  Future<void> _loadPersistedResponseCache() async {
+    final cached = await _responseCache.load();
+    if (cached != null && mounted) {
+      setState(() {
+        _lastResponsePcm = cached.pcmBytes;
+        _lastResponseText = cached.transcript;
+      });
+    }
+  }
+
+  Future<void> _refreshPendingCount() async {
+    final count = await _offlineQueue.pendingCount();
+    if (mounted) setState(() => _pendingCount = count);
   }
 
   /// Plays the "session ready" chime once, then starts continuous
@@ -95,6 +138,9 @@ class _SessionScreenState extends State<SessionScreen> {
   Future<void> _initSession() async {
     await _chime.playStart();
     await _startListening();
+    // In case questions queued up while the app was closed and the device
+    // is already back online by the time this session opens.
+    _drainOfflineQueue();
   }
 
   Future<void> _startListening() async {
@@ -119,9 +165,9 @@ class _SessionScreenState extends State<SessionScreen> {
         model: 'v5', // newer model than the package default 'legacy'
       )
           .timeout(
-        const Duration(seconds: 60),
+        const Duration(seconds: 15),
         onTimeout: () => throw TimeoutException(
-          'VAD model failed to load within 60s — likely a network '
+          'VAD model failed to load within 15s — likely a network '
               'issue reaching the model CDN (jsdelivr).',
         ),
       );
@@ -173,25 +219,54 @@ class _SessionScreenState extends State<SessionScreen> {
     if (!mounted) return;
     setState(() => _state = AssistantState.processing);
 
+    // Silero VAD (what the `vad` package wraps) operates at 16kHz —
+    // confirm this matches your package version's actual output rate.
+    final int16Samples = floatToInt16(samples);
+    final wavBytes = encodeWav(int16Samples, sampleRate: 16000);
+
+    AskStreamResult? result;
     try {
-      // Silero VAD (what the `vad` package wraps) operates at 16kHz —
-      // confirm this matches your package version's actual output rate.
-      final int16Samples = floatToInt16(samples);
+      result = await widget.apiService.askQuestionStream(widget.sessionId, wavBytes);
+    } catch (e) {
+      // Distinguish "couldn't reach the server at all" (network down —
+      // queue it, nothing is lost) from a real backend error (e.g. a 4xx/5xx
+      // response) — retrying a genuine error forever would be pointless, so
+      // only connectivity-shaped failures get queued. See ApiService: that
+      // message prefix is only used for the exception thrown around the
+      // HTTP send() call itself (SocketException/TimeoutException/etc),
+      // never for a non-200 response.
+      final isOffline = e is ApiException && e.message.startsWith('Could not reach server');
+      if (isOffline) {
+        await _offlineQueue.enqueue(widget.sessionId, wavBytes);
+        await _refreshPendingCount();
+        if (mounted) {
+          setState(() {
+            _state = AssistantState.idle;
+            _errorMessage = null;
+            _lastResponseText =
+            "You're offline — this question has been saved and will be "
+                "answered automatically once you're back online.";
+          });
+        }
+      } else {
+        if (mounted) {
+          setState(() {
+            _state = AssistantState.error;
+            _errorMessage = 'Request failed: $e';
+          });
+        }
+      }
+    }
 
-      // Chime marks "the assistant is about to respond" — plays right
-      // before playback starts, not on speech end itself.
-      final wavBytes = encodeWav(int16Samples, sampleRate: 16000);
-      final result = await widget.apiService.askQuestionStream(
-        widget.sessionId,
-        wavBytes,
-      );
-
+    if (result != null) {
       if (!mounted) return;
       setState(() {
-        _lastResponseText = result.transcript;
+        _lastResponseText = result!.transcript;
         _state = AssistantState.speaking;
       });
 
+      // Chime marks "the assistant is about to respond" — plays right
+      // before playback starts, not on speech end itself.
       await _chime.playEnd();
 
       // Tee the stream: one copy feeds live playback as before, the other
@@ -208,19 +283,20 @@ class _SessionScreenState extends State<SessionScreen> {
         onError: teeController.addError,
       );
 
-      await _playback.playStream(teeController.stream);
-      await teeSub.cancel();
-      result.close();
-
-      _lastResponsePcm = bytesBuilder.toBytes();
-      _pushResponseTextQueue(result.transcript);
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _state = AssistantState.error;
-          _errorMessage = 'Playback failed: $e';
-        });
+      try {
+        await _playback.playStream(teeController.stream);
+      } finally {
+        await teeSub.cancel();
+        result.close();
       }
+
+      final pcmBytes = bytesBuilder.toBytes();
+      if (mounted) setState(() => _lastResponsePcm = pcmBytes);
+      _pushResponseTextQueue(result.transcript);
+
+      // Persist durably so Replay survives an app restart / works with no
+      // network — fire-and-forget, playback has already finished either way.
+      unawaited(_responseCache.save(widget.sessionId, result.transcript, pcmBytes));
     }
 
     // Resume continuous listening for the next utterance. VAD (not a wake
@@ -238,6 +314,36 @@ class _SessionScreenState extends State<SessionScreen> {
     await _startListening();
   }
 
+  /// Sends every queued (previously offline) question, oldest first. Safe
+  /// to call opportunistically — connectivity-change events, session start,
+  /// and a manual retry can all call this, and it no-ops while already
+  /// running or when the queue is empty.
+  Future<void> _drainOfflineQueue() async {
+    if (_isDraining) return;
+    _isDraining = true;
+    try {
+      final sent = await _offlineQueue.drainQueue(
+        widget.apiService,
+        onItemSent: (answer) async {
+          if (mounted) {
+            setState(() {
+              _lastResponsePcm = answer.pcmBytes;
+              _lastResponseText = answer.transcript;
+            });
+          }
+        },
+      );
+      if (sent > 0) {
+        debugPrint('[Offline] sent $sent queued question(s).');
+      }
+    } catch (e) {
+      debugPrint('[Offline] drain attempt stopped: $e');
+    } finally {
+      _isDraining = false;
+      await _refreshPendingCount();
+    }
+  }
+
   void _pushResponseTextQueue(String text) {
     _responseTextQueue.add(text);
     if (_responseTextQueue.length > _maxQueueSize) {
@@ -250,7 +356,8 @@ class _SessionScreenState extends State<SessionScreen> {
     if (pcm == null) return;
 
     // Same pause-VAD-during-playback rule as a normal turn, so the
-    // assistant's own audio can't be picked up as new speech.
+    // assistant's own audio can't be picked up as new speech. This works
+    // fully offline — the bytes came from ResponseCacheService on disk.
     await _vadHandler.stopListening();
     if (mounted) setState(() => _state = AssistantState.speaking);
 
@@ -267,6 +374,7 @@ class _SessionScreenState extends State<SessionScreen> {
     _speechEndSub?.cancel();
     _misfireSub?.cancel();
     _errorSub?.cancel();
+    _connectivitySub?.cancel();
     // dispose() must be synchronous, but stopListening() is async — if we
     // fire both without sequencing, _vadHandler.dispose() (which closes
     // internal StreamControllers) can run while a frame is still mid-flight
@@ -316,6 +424,29 @@ class _SessionScreenState extends State<SessionScreen> {
                           Icon(_iconForState(), size: 64, color: _colorForState()),
                           const SizedBox(height: 16),
                           Text(_labelForState(), style: const TextStyle(fontSize: 18)),
+                        ],
+                        if (_pendingCount > 0) ...[
+                          const SizedBox(height: 12),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: Colors.orange.withOpacity(0.15),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.cloud_off, size: 18, color: Colors.orange),
+                                const SizedBox(width: 8),
+                                Text(
+                                  _pendingCount == 1
+                                      ? '1 question waiting to send'
+                                      : '$_pendingCount questions waiting to send',
+                                  style: const TextStyle(fontSize: 13),
+                                ),
+                              ],
+                            ),
+                          ),
                         ],
                         if (_state == AssistantState.error) ...[
                           const SizedBox(height: 16),
@@ -409,7 +540,7 @@ class _SessionScreenState extends State<SessionScreen> {
       case AssistantState.processing:
         return Colors.orange;
       case AssistantState.speaking:
-        return const Color(0xFF00776A); // brand teal, matches splash accent
+        return Colors.indigo;
       case AssistantState.error:
         return Colors.red.shade900;
     }

@@ -40,6 +40,7 @@ dependencies:
   flutter_svg: ^2.0.10
   flutter_sound: ^9.30.0
   google_fonts: ^6.2.1
+  connectivity_plus: ^6.1.0
   # pin to whatever the actual current version is
 
 
