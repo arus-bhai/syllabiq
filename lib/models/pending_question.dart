@@ -4,12 +4,17 @@
 class PendingQuestion {
   PendingQuestion({
     required this.id,
+    required this.syllabusId,
     required this.sessionId,
     required this.wavPath,
     required this.createdAt,
   });
 
   final int id;
+
+  /// The syllabus this question was asked in — its answer is cached under
+  /// this id so it never appears in a different subject.
+  final String syllabusId;
   final String sessionId;
 
   /// Path to the recorded utterance's WAV file on disk. Stored as a file
@@ -21,6 +26,7 @@ class PendingQuestion {
   factory PendingQuestion.fromDbMap(Map<String, dynamic> map) {
     return PendingQuestion(
       id: map['id'] as int,
+      syllabusId: map['syllabus_id'] as String,
       sessionId: map['session_id'] as String,
       wavPath: map['wav_path'] as String,
       createdAt: DateTime.parse(map['created_at'] as String),

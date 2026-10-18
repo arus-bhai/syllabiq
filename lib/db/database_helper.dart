@@ -23,7 +23,7 @@ class DatabaseHelper {
 
     return openDatabase(
       path,
-      version: 3,
+      version: 4,
       onCreate: (db, version) async {
         await db.execute('''
         CREATE TABLE syllabi (
@@ -41,7 +41,13 @@ class DatabaseHelper {
         if (oldVersion < 2) {
           await _createSessionsTable(db);
         }
-        if (oldVersion < 3) {
+        if (oldVersion < 4) {
+          // v3 kept ONE global last answer and an unattributed queue, so a
+          // Geography answer could show up under History. v4 keys both by
+          // syllabus. The old rows can't be attributed to a syllabus, so the
+          // tables are rebuilt (recreated cleanly, not migrated).
+          await db.execute('DROP TABLE IF EXISTS pending_questions');
+          await db.execute('DROP TABLE IF EXISTS last_response');
           await _createOfflineTables(db);
         }
       },
@@ -62,13 +68,15 @@ class DatabaseHelper {
 
   /// `pending_questions` queues recorded questions that couldn't reach the
   /// backend (offline / unreachable) — drained and sent once connectivity
-  /// returns. `last_response` is a single-row table (id is always 1) that
-  /// durably caches the most recent spoken answer, so "Replay last
-  /// response" survives an app restart and works fully offline.
+  /// returns. `last_response` holds one row PER SYLLABUS (syllabus_id is the
+  /// primary key) with the most recent spoken answer for that syllabus, so
+  /// "Replay last response" survives an app restart, works fully offline,
+  /// and never shows one subject's answer inside another.
   Future<void> _createOfflineTables(Database db) async {
     await db.execute('''
     CREATE TABLE pending_questions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      syllabus_id TEXT NOT NULL,
       session_id TEXT NOT NULL,
       wav_path TEXT NOT NULL,
       created_at TEXT NOT NULL
@@ -76,7 +84,7 @@ class DatabaseHelper {
   ''');
     await db.execute('''
     CREATE TABLE last_response (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
+      syllabus_id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
       transcript TEXT NOT NULL,
       pcm_path TEXT NOT NULL,
@@ -153,11 +161,13 @@ class DatabaseHelper {
   // ---------------------------------------------------------------------
 
   Future<void> insertPendingQuestion({
+    required String syllabusId,
     required String sessionId,
     required String wavPath,
   }) async {
     final db = await database;
     await db.insert('pending_questions', {
+      'syllabus_id': syllabusId,
       'session_id': sessionId,
       'wav_path': wavPath,
       'created_at': DateTime.now().toIso8601String(),
@@ -165,9 +175,15 @@ class DatabaseHelper {
   }
 
   /// Oldest first, so queued questions are sent in the order they were asked.
-  Future<List<PendingQuestion>> getPendingQuestions() async {
+  /// Pass [syllabusId] to get only that syllabus's queued question(s).
+  Future<List<PendingQuestion>> getPendingQuestions({String? syllabusId}) async {
     final db = await database;
-    final rows = await db.query('pending_questions', orderBy: 'created_at ASC');
+    final rows = await db.query(
+      'pending_questions',
+      where: syllabusId == null ? null : 'syllabus_id = ?',
+      whereArgs: syllabusId == null ? null : [syllabusId],
+      orderBy: 'created_at ASC',
+    );
     return rows.map(PendingQuestion.fromDbMap).toList();
   }
 
@@ -177,10 +193,11 @@ class DatabaseHelper {
   }
 
   // ---------------------------------------------------------------------
-  // Last-response cache (single row, id = 1)
+  // Last-response cache (one row per syllabus)
   // ---------------------------------------------------------------------
 
   Future<void> saveLastResponse({
+    required String syllabusId,
     required String sessionId,
     required String transcript,
     required String pcmPath,
@@ -189,7 +206,7 @@ class DatabaseHelper {
     await db.insert(
       'last_response',
       {
-        'id': 1,
+        'syllabus_id': syllabusId,
         'session_id': sessionId,
         'transcript': transcript,
         'pcm_path': pcmPath,
@@ -199,9 +216,14 @@ class DatabaseHelper {
     );
   }
 
-  Future<Map<String, dynamic>?> getLastResponse() async {
+  Future<Map<String, dynamic>?> getLastResponse(String syllabusId) async {
     final db = await database;
-    final rows = await db.query('last_response', where: 'id = 1', limit: 1);
+    final rows = await db.query(
+      'last_response',
+      where: 'syllabus_id = ?',
+      whereArgs: [syllabusId],
+      limit: 1,
+    );
     if (rows.isEmpty) return null;
     return rows.first;
   }

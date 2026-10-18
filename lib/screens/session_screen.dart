@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -10,19 +11,38 @@ import '../services/chime_player.dart';
 import '../services/live_pcm_player.dart';
 import '../services/offline_queue_service.dart';
 import '../services/response_cache_service.dart';
+import '../services/vad_model_cache.dart';
 import '../utils/wav_encoder.dart';
 import '../widgets/listening_mic_indicator.dart';
 import '../widgets/study_background.dart';
 
-enum AssistantState { initializing, idle, listening, processing, speaking, error }
+enum AssistantState {
+  initializing,
+  idle,
+  listening,
+  processing,
+  speaking,
+  error,
+
+  /// Recording couldn't start because the device has no connection (the VAD
+  /// model couldn't be loaded). Not a real fault: Replay still works, and
+  /// listening starts again automatically once the network returns.
+  offline,
+}
 
 class SessionScreen extends StatefulWidget {
   const SessionScreen({
     super.key,
     required this.sessionId,
+    required this.syllabusId,
     required this.syllabusTitle,
     required this.apiService,
   });
+
+  /// Identifies the syllabus (subject) being studied. The cached last answer
+  /// and any queued question are stored under this id, not the session id —
+  /// sessions expire and are recreated, the syllabus stays the same.
+  final String syllabusId;
 
   final String sessionId;
   final String syllabusTitle;
@@ -106,7 +126,11 @@ class _SessionScreenState extends State<SessionScreen> {
     // "wifi" while the wifi has no real internet access).
     _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
       final online = results.any((r) => r != ConnectivityResult.none);
-      if (online) _drainOfflineQueue();
+      if (online) {
+        _drainOfflineQueue();
+        // Recording couldn't start while offline — try again now.
+        if (_state == AssistantState.offline) _startListening();
+      }
     });
 
     _loadPersistedResponseCache();
@@ -118,7 +142,7 @@ class _SessionScreenState extends State<SessionScreen> {
   /// previous app run, or from a question that was queued offline and sent
   /// in the background) so Replay works immediately, even with no network.
   Future<void> _loadPersistedResponseCache() async {
-    final cached = await _responseCache.load();
+    final cached = await _responseCache.load(widget.syllabusId);
     if (cached != null && mounted) {
       setState(() {
         _lastResponsePcm = cached.pcmBytes;
@@ -128,7 +152,7 @@ class _SessionScreenState extends State<SessionScreen> {
   }
 
   Future<void> _refreshPendingCount() async {
-    final count = await _offlineQueue.pendingCount();
+    final count = await _offlineQueue.pendingCount(syllabusId: widget.syllabusId);
     if (mounted) setState(() => _pendingCount = count);
   }
 
@@ -156,22 +180,24 @@ class _SessionScreenState extends State<SessionScreen> {
       });
     }
     try {
-      await _vadHandler
-          .startListening(
-        positiveSpeechThreshold: 0.5,
-        negativeSpeechThreshold: 0.35,
-        redemptionFrames: 8,
-        minSpeechFrames: 3,
-        model: 'v5', // newer model than the package default 'legacy'
-      )
-          .timeout(
-        const Duration(seconds: 15),
-        onTimeout: () => throw TimeoutException(
-          'VAD model failed to load within 15s — likely a network '
-              'issue reaching the model CDN (jsdelivr).',
-        ),
-      );
+      // Prefer a locally cached copy of the model so listening can start
+      // without the network. If the package doesn't accept it, fall back to
+      // its default CDN location.
+      final localBase = await VadModelCache.localBasePath();
+      if (localBase != null) {
+        try {
+          await _startVad(baseAssetPath: localBase);
+          debugPrint('[VAD] started from cached local model');
+        } catch (e) {
+          debugPrint('[VAD] cached model rejected ($e), falling back to CDN');
+          await _startVad();
+        }
+      } else {
+        await _startVad();
+      }
       _vadInitialized = true;
+      // Save the model for next time (no-op if already cached or offline).
+      unawaited(VadModelCache.warmUp());
       if (mounted) {
         setState(() {
           _state = AssistantState.idle;
@@ -179,13 +205,58 @@ class _SessionScreenState extends State<SessionScreen> {
         });
       }
     } catch (e) {
-      if (mounted) {
+      if (!mounted) return;
+      if (await _looksOffline(e)) {
+        setState(() {
+          _state = AssistantState.offline;
+          _errorMessage = null;
+        });
+      } else {
         setState(() {
           _state = AssistantState.error;
           _errorMessage = 'Could not start listening: $e';
         });
       }
     }
+  }
+
+  Future<void> _startVad({String? baseAssetPath}) {
+    const timeout = Duration(seconds: 15);
+    Never onTimeout() => throw TimeoutException(
+      'VAD model failed to load within 15s — likely a network '
+          'issue reaching the model CDN (jsdelivr).',
+    );
+    final future = baseAssetPath == null
+        ? _vadHandler.startListening(
+      positiveSpeechThreshold: 0.5,
+      negativeSpeechThreshold: 0.35,
+      redemptionFrames: 8,
+      minSpeechFrames: 3,
+      model: 'v5', // newer model than the package default 'legacy'
+    )
+        : _vadHandler.startListening(
+      positiveSpeechThreshold: 0.5,
+      negativeSpeechThreshold: 0.35,
+      redemptionFrames: 8,
+      minSpeechFrames: 3,
+      model: 'v5',
+      baseAssetPath: baseAssetPath,
+    );
+    return future.timeout(timeout, onTimeout: onTimeout);
+  }
+
+  /// True when a failure to start listening is down to having no network
+  /// (as opposed to, say, a denied microphone permission).
+  Future<bool> _looksOffline(Object error) async {
+    if (error is SocketException || error is TimeoutException) return true;
+    final text = error.toString();
+    if (text.contains('SocketException') ||
+        text.contains('Failed host lookup') ||
+        text.contains('ClientException')) {
+      return true;
+    }
+    final results = await Connectivity().checkConnectivity();
+    return results.every((r) => r == ConnectivityResult.none);
   }
 
   void _onSpeechStart() {
@@ -237,7 +308,7 @@ class _SessionScreenState extends State<SessionScreen> {
       // never for a non-200 response.
       final isOffline = e is ApiException && e.message.startsWith('Could not reach server');
       if (isOffline) {
-        await _offlineQueue.enqueue(widget.sessionId, wavBytes);
+        await _offlineQueue.enqueue(widget.syllabusId, widget.sessionId, wavBytes);
         await _refreshPendingCount();
         if (mounted) {
           setState(() {
@@ -296,7 +367,12 @@ class _SessionScreenState extends State<SessionScreen> {
 
       // Persist durably so Replay survives an app restart / works with no
       // network — fire-and-forget, playback has already finished either way.
-      unawaited(_responseCache.save(widget.sessionId, result.transcript, pcmBytes));
+      unawaited(_responseCache.save(
+        widget.syllabusId,
+        widget.sessionId,
+        result.transcript,
+        pcmBytes,
+      ));
     }
 
     // Resume continuous listening for the next utterance. VAD (not a wake
@@ -325,7 +401,9 @@ class _SessionScreenState extends State<SessionScreen> {
       final sent = await _offlineQueue.drainQueue(
         widget.apiService,
         onItemSent: (answer) async {
-          if (mounted) {
+          // The answer is already cached under its own syllabus; only show
+          // it here if it belongs to the syllabus this screen is for.
+          if (mounted && answer.syllabusId == widget.syllabusId) {
             setState(() {
               _lastResponsePcm = answer.pcmBytes;
               _lastResponseText = answer.transcript;
@@ -448,7 +526,18 @@ class _SessionScreenState extends State<SessionScreen> {
                             ),
                           ),
                         ],
-                        if (_state == AssistantState.error) ...[
+                        if (_state == AssistantState.offline) ...[
+                          const SizedBox(height: 8),
+                          const Text(
+                            'Recording starts again automatically when '
+                                "you're back online. You can still replay the "
+                                'last answer.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(fontSize: 13, color: Colors.black54),
+                          ),
+                        ],
+                        if (_state == AssistantState.error ||
+                            _state == AssistantState.offline) ...[
                           const SizedBox(height: 16),
                           ElevatedButton.icon(
                             onPressed: _startListening,
@@ -467,7 +556,8 @@ class _SessionScreenState extends State<SessionScreen> {
                         ],
                         if (_lastResponsePcm != null &&
                             (_state == AssistantState.idle ||
-                                _state == AssistantState.listening)) ...[
+                                _state == AssistantState.listening ||
+                                _state == AssistantState.offline)) ...[
                           const SizedBox(height: 16),
                           OutlinedButton.icon(
                             onPressed: _replayLast,
@@ -526,6 +616,8 @@ class _SessionScreenState extends State<SessionScreen> {
         return Icons.volume_up;
       case AssistantState.error:
         return Icons.error_outline;
+      case AssistantState.offline:
+        return Icons.cloud_off;
     }
   }
 
@@ -543,6 +635,8 @@ class _SessionScreenState extends State<SessionScreen> {
         return Colors.indigo;
       case AssistantState.error:
         return Colors.red.shade900;
+      case AssistantState.offline:
+        return Colors.orange.shade800;
     }
   }
 
@@ -560,6 +654,8 @@ class _SessionScreenState extends State<SessionScreen> {
         return 'Playing back your recording...';
       case AssistantState.error:
         return 'Something went wrong';
+      case AssistantState.offline:
+        return "You're offline";
     }
   }
 }

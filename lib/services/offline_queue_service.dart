@@ -12,7 +12,15 @@ import 'response_cache_service.dart';
 /// whoever called [OfflineQueueService.drainQueue] so it can update the UI
 /// if a session screen happens to be open.
 class DrainedAnswer {
-  DrainedAnswer({required this.transcript, required this.pcmBytes});
+  DrainedAnswer({
+    required this.syllabusId,
+    required this.transcript,
+    required this.pcmBytes,
+  });
+
+  /// The syllabus the question was asked in, so a screen showing a
+  /// different syllabus can ignore this answer.
+  final String syllabusId;
   final String transcript;
   final Uint8List pcmBytes;
 }
@@ -38,11 +46,16 @@ class OfflineQueueService {
   }
 
   /// Saves a recorded question that couldn't be sent right now. The queue
-  /// holds at most ONE question: if the connection is down the user won't
-  /// keep asking, so a newer question simply replaces any older queued one
-  /// (its file and row are deleted first).
-  Future<void> enqueue(String sessionId, Uint8List wavBytes) async {
-    for (final old in await _db.getPendingQuestions()) {
+  /// holds at most ONE question per syllabus: if the connection is down the
+  /// user won't keep asking, so a newer question for the same syllabus
+  /// replaces the older one (its file and row are deleted first). Questions
+  /// queued for other syllabi are left alone.
+  Future<void> enqueue(
+    String syllabusId,
+    String sessionId,
+    Uint8List wavBytes,
+  ) async {
+    for (final old in await _db.getPendingQuestions(syllabusId: syllabusId)) {
       final oldFile = File(old.wavPath);
       if (await oldFile.exists()) await oldFile.delete();
       await _db.deletePendingQuestion(old.id);
@@ -53,10 +66,16 @@ class OfflineQueueService {
     final file = File(p.join(dir.path, fileName));
     await file.writeAsBytes(wavBytes, flush: true);
 
-    await _db.insertPendingQuestion(sessionId: sessionId, wavPath: file.path);
+    await _db.insertPendingQuestion(
+      syllabusId: syllabusId,
+      sessionId: sessionId,
+      wavPath: file.path,
+    );
   }
 
-  Future<int> pendingCount() async => (await _db.getPendingQuestions()).length;
+  /// How many questions are waiting, optionally for one syllabus only.
+  Future<int> pendingCount({String? syllabusId}) async =>
+      (await _db.getPendingQuestions(syllabusId: syllabusId)).length;
 
   /// Attempts to send every queued question, oldest first. Stops at the
   /// first failure (connectivity has likely dropped again) and leaves that
@@ -94,14 +113,23 @@ class OfflineQueueService {
         final bytes = await _collectStream(result.pcmStream);
         result.close();
 
-        await _responseCache.save(item.sessionId, result.transcript, bytes);
+        await _responseCache.save(
+          item.syllabusId,
+          item.sessionId,
+          result.transcript,
+          bytes,
+        );
         await _db.deletePendingQuestion(item.id);
         await file.delete();
         sentCount++;
 
         if (onItemSent != null) {
           await onItemSent(
-            DrainedAnswer(transcript: result.transcript, pcmBytes: bytes),
+            DrainedAnswer(
+              syllabusId: item.syllabusId,
+              transcript: result.transcript,
+              pcmBytes: bytes,
+            ),
           );
         }
       } catch (e) {

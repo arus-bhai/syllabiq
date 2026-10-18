@@ -15,13 +15,13 @@ class SyllabusListScreen extends StatefulWidget {
 
   final SyllabusRepository repository;
 
-  /// When set, only syllabi matching this grade are shown, and the AppBar
-  /// title reflects the selected grade instead of the generic default.
+  /// When set, only syllabi for this grade are shown (and the title reads
+  /// "Grade X Syllabi"). Leave null to list every syllabus.
   final String? gradeFilter;
 
-  /// When set (i.e. navigated here from GradeSelectScreen, which already
-  /// fetched everything), skips the initial network/cache fetch and just
-  /// filters this in place. Pull-to-refresh still re-fetches normally.
+  /// A result the caller already loaded (the grade picker loads once), so
+  /// this screen can show it immediately instead of fetching again. Pull to
+  /// refresh still reloads from the repository.
   final SyllabusLoadResult? preloaded;
 
   @override
@@ -38,14 +38,16 @@ class _SyllabusListScreenState extends State<SyllabusListScreen> {
   @override
   void initState() {
     super.initState();
-    if (widget.preloaded != null) {
-      _applyResult(widget.preloaded!);
+    final preloaded = widget.preloaded;
+    if (preloaded != null) {
+      _applyResult(preloaded);
       _loading = false;
     } else {
       _load();
     }
   }
 
+  /// Stores a load result, keeping only the selected grade when filtering.
   void _applyResult(SyllabusLoadResult result) {
     final grade = widget.gradeFilter;
     _syllabi = grade == null
@@ -85,6 +87,7 @@ class _SyllabusListScreenState extends State<SyllabusListScreen> {
         MaterialPageRoute(
           builder: (_) => SessionScreen(
             sessionId: result.sessionId,
+            syllabusId: result.syllabusId,
             syllabusTitle: result.syllabusTitle,
             apiService: widget.repository.apiService,
           ),
@@ -105,9 +108,9 @@ class _SyllabusListScreenState extends State<SyllabusListScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          widget.gradeFilter != null
-              ? 'Grade ${widget.gradeFilter} Syllabi'
-              : 'Select Syllabus',
+          widget.gradeFilter == null
+              ? 'Select Syllabus'
+              : 'Grade ${widget.gradeFilter} Syllabi',
         ),
         actions: [
           IconButton(

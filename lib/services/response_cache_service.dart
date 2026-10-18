@@ -26,36 +26,40 @@ class CachedResponse {
 /// disk, so "Replay last response" keeps working after an app restart and
 /// with no network at all — not just within one still-open session.
 ///
-/// Only ever the single latest answer is kept — same scope as the
-/// in-memory `_lastResponsePcm` field it backs in the session screen. This
-/// is durable replay, not a history.
+/// Only the single latest answer PER SYLLABUS is kept, so replaying in
+/// History never plays an answer that was generated for Geography. This is
+/// durable replay, not a history.
 class ResponseCacheService {
   final DatabaseHelper _db = DatabaseHelper.instance;
 
-  Future<File> _pcmFile() async {
+  Future<File> _pcmFile(String syllabusId) async {
     final base = await getApplicationSupportDirectory();
-    return File(p.join(base.path, 'last_response.pcm'));
+    // Syllabus ids are UUIDs, but never trust an id inside a file name.
+    final safeId = syllabusId.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+    return File(p.join(base.path, 'last_response_$safeId.pcm'));
   }
 
-  /// Overwrites whatever was cached before with this answer.
+  /// Overwrites whatever was cached before for this syllabus with this answer.
   Future<void> save(
+    String syllabusId,
     String sessionId,
     String transcript,
     Uint8List pcmBytes,
   ) async {
-    final file = await _pcmFile();
+    final file = await _pcmFile(syllabusId);
     await file.writeAsBytes(pcmBytes, flush: true);
     await _db.saveLastResponse(
+      syllabusId: syllabusId,
       sessionId: sessionId,
       transcript: transcript,
       pcmPath: file.path,
     );
   }
 
-  /// Returns null if nothing has ever been cached, or if the cached file
-  /// has gone missing from disk for some reason.
-  Future<CachedResponse?> load() async {
-    final row = await _db.getLastResponse();
+  /// Returns null if nothing has been cached for this syllabus, or if the
+  /// cached file has gone missing from disk for some reason.
+  Future<CachedResponse?> load(String syllabusId) async {
+    final row = await _db.getLastResponse(syllabusId);
     if (row == null) return null;
 
     final file = File(row['pcm_path'] as String);
