@@ -74,6 +74,7 @@ class _SessionScreenState extends State<SessionScreen> {
   /// model should already be resident and startListening() should resolve
   /// quickly rather than re-fetching from the CDN.
   bool _vadInitialized = false;
+  String? _vadLocalBase;
 
   /// Audio for the most recent response only — enough for the replay
   /// button. Not kept per history entry; only ever the latest one. Backed
@@ -183,18 +184,28 @@ class _SessionScreenState extends State<SessionScreen> {
       // Prefer a locally cached copy of the model so listening can start
       // without the network. If the package doesn't accept it, fall back to
       // its default CDN location.
-      final localBase = await VadModelCache.localBasePath();
-      if (localBase != null) {
-        try {
-          await _startVad(baseAssetPath: localBase);
-          debugPrint('[VAD] started from cached local model');
-        } catch (e) {
-          debugPrint('[VAD] cached model rejected ($e), falling back to CDN');
+      // Once a start has worked in this screen, reuse exactly that mode for
+      // every restart — only the FIRST start negotiates local vs CDN.
+      final sw = Stopwatch()..start();
+      if (_vadInitialized) {
+        await _startVad(baseAssetPath: _vadLocalBase);
+      } else {
+        final localBase = await VadModelCache.localBasePath();
+        if (localBase != null) {
+          try {
+            await _startVad(baseAssetPath: localBase);
+            _vadLocalBase = localBase;
+            debugPrint('[VAD] started from cached local model');
+          } catch (e) {
+            debugPrint('[VAD] cached model rejected ($e), falling back to CDN');
+            await _startVad();
+          }
+        } else {
           await _startVad();
         }
-      } else {
-        await _startVad();
       }
+      debugPrint('[VAD] listening again (${sw.elapsedMilliseconds} ms, '
+          'local=${_vadLocalBase != null})');
       _vadInitialized = true;
       // Save the model for next time (no-op if already cached or offline).
       unawaited(VadModelCache.warmUp());

@@ -21,6 +21,8 @@ class LivePcmPlayer {
   Uint8List? _leftoverByte;
   int _samplesFed = 0;
   DateTime? _firstFeedTime;
+  // When the audio fed so far will finish playing, on the wall clock.
+  DateTime _playEnd = DateTime.now();
 
   Future<void> _ensureOpen() async {
     if (_openDone) return;
@@ -41,6 +43,7 @@ class LivePcmPlayer {
     _leftoverByte = null;
     _samplesFed = 0;
     _firstFeedTime = null;
+    _playEnd = DateTime.now();
 
     await _player.startPlayerFromStream(
       codec: Codec.pcm16,
@@ -72,24 +75,30 @@ class LivePcmPlayer {
       // foodSink/FoodData was deprecated in 9.27.0 and is unavailable on
       // current versions — feedUint8FromStream is the current push API.
       await _player.feedUint8FromStream(aligned);
+
+      // Track when everything fed so far will have been played. If the
+      // network delivers slower than real time the player underruns, so each
+      // chunk starts playing at max(now, previous end).
+      final chunkDuration = Duration(
+        microseconds: (aligned.length ~/ 2) * 1000000 ~/ sampleRate,
+      );
+      final now = DateTime.now();
+      final start = _playEnd.isAfter(now) ? _playEnd : now;
+      _playEnd = start.add(chunkDuration);
     }
 
     debugPrint(
       '[LivePcmPlayer] stream done — $chunkCount chunks, $_samplesFed samples total',
     );
 
-    // Feeding finishes well before playback actually does — wait out
-    // whatever's left based on total duration fed vs time elapsed.
-    if (_firstFeedTime != null && _samplesFed > 0) {
-      final totalDuration = Duration(
-        milliseconds: (_samplesFed / sampleRate * 1000).round(),
-      );
-      final elapsed = DateTime.now().difference(_firstFeedTime!);
-      final remaining = totalDuration - elapsed;
-      if (remaining > Duration.zero) {
-        await Future.delayed(remaining + const Duration(milliseconds: 150));
-      }
+    // Feeding finishes before playback does. Wait until the last fed chunk
+    // has actually played (plus a safety margin for the native buffer) —
+    // stopping earlier cuts the end of the answer off.
+    final remaining = _playEnd.difference(DateTime.now());
+    if (remaining > Duration.zero) {
+      await Future.delayed(remaining);
     }
+    await Future.delayed(const Duration(milliseconds: 600));
 
     await _player.stopPlayer();
   }
